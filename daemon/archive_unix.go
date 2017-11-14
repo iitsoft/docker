@@ -2,13 +2,19 @@
 
 package daemon
 
+import (
+	"github.com/docker/docker/container"
+	"github.com/docker/docker/volume"
+)
+
 // checkIfPathIsInAVolume checks if the path is in a volume. If it is, it
 // cannot be in a read-only volume. If it  is not in a volume, the container
 // cannot be configured with a read-only rootfs.
-func checkIfPathIsInAVolume(container *Container, absPath string) (bool, error) {
+func checkIfPathIsInAVolume(container *container.Container, absPath string) (bool, error) {
 	var toVolume bool
+	parser := volume.NewParser(container.OS)
 	for _, mnt := range container.MountPoints {
-		if toVolume = mnt.hasResource(absPath); toVolume {
+		if toVolume = parser.HasResource(mnt, absPath); toVolume {
 			if mnt.RW {
 				break
 			}
@@ -16,4 +22,10 @@ func checkIfPathIsInAVolume(container *Container, absPath string) (bool, error) 
 		}
 	}
 	return toVolume, nil
+}
+
+// isOnlineFSOperationPermitted returns an error if an online filesystem operation
+// is not permitted.
+func (daemon *Daemon) isOnlineFSOperationPermitted(container *container.Container) error {
+	return nil
 }

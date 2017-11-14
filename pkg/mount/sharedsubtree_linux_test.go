@@ -5,8 +5,9 @@ package mount
 import (
 	"os"
 	"path"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // nothing is propagated in or out
@@ -168,7 +169,7 @@ func TestSubtreeShared(t *testing.T) {
 		}
 	}()
 
-	// NOW, check that the file from the outside directory is avaible in the source directory
+	// NOW, check that the file from the outside directory is available in the source directory
 	if _, err := os.Stat(sourceCheckPath); err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +310,7 @@ func TestSubtreeUnbindable(t *testing.T) {
 	}()
 
 	// then attempt to mount it to target. It should fail
-	if err := Mount(sourceDir, targetDir, "none", "bind,rw"); err != nil && err != syscall.EINVAL {
+	if err := Mount(sourceDir, targetDir, "none", "bind,rw"); err != nil && err != unix.EINVAL {
 		t.Fatal(err)
 	} else if err == nil {
 		t.Fatalf("%q should not have been bindable", sourceDir)

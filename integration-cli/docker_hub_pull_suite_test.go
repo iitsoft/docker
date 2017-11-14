@@ -5,6 +5,8 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/docker/docker/integration-cli/checker"
+	"github.com/docker/docker/integration-cli/daemon"
 	"github.com/go-check/check"
 )
 
@@ -16,7 +18,7 @@ func init() {
 	}
 }
 
-// DockerHubPullSuite provides a isolated daemon that doesn't have all the
+// DockerHubPullSuite provides an isolated daemon that doesn't have all the
 // images that are baked into our 'global' test environment daemon (e.g.,
 // busybox, httpserver, ...).
 //
@@ -24,7 +26,7 @@ func init() {
 // relative impact of each individual operation. As part of this suite, all
 // images are removed after each test.
 type DockerHubPullSuite struct {
-	d  *Daemon
+	d  *daemon.Daemon
 	ds *DockerSuite
 }
 
@@ -37,19 +39,17 @@ func newDockerHubPullSuite() *DockerHubPullSuite {
 
 // SetUpSuite starts the suite daemon.
 func (s *DockerHubPullSuite) SetUpSuite(c *check.C) {
-	testRequires(c, DaemonIsLinux)
-	s.d = NewDaemon(c)
-	if err := s.d.Start(); err != nil {
-		c.Fatalf("starting push/pull test daemon: %v", err)
-	}
+	testRequires(c, DaemonIsLinux, SameHostDaemon)
+	s.d = daemon.New(c, dockerBinary, dockerdBinary, daemon.Config{
+		Experimental: testEnv.ExperimentalDaemon(),
+	})
+	s.d.Start(c)
 }
 
 // TearDownSuite stops the suite daemon.
 func (s *DockerHubPullSuite) TearDownSuite(c *check.C) {
 	if s.d != nil {
-		if err := s.d.Stop(); err != nil {
-			c.Fatalf("stopping push/pull test daemon: %v", err)
-		}
+		s.d.Stop(c)
 	}
 }
 
@@ -62,8 +62,8 @@ func (s *DockerHubPullSuite) SetUpTest(c *check.C) {
 func (s *DockerHubPullSuite) TearDownTest(c *check.C) {
 	out := s.Cmd(c, "images", "-aq")
 	images := strings.Split(out, "\n")
-	images = append([]string{"-f"}, images...)
-	s.d.Cmd("rmi", images...)
+	images = append([]string{"rmi", "-f"}, images...)
+	s.d.Cmd(images...)
 	s.ds.TearDownTest(c)
 }
 
@@ -71,7 +71,7 @@ func (s *DockerHubPullSuite) TearDownTest(c *check.C) {
 // output. The function fails the test when the command returns an error.
 func (s *DockerHubPullSuite) Cmd(c *check.C, name string, arg ...string) string {
 	out, err := s.CmdWithError(name, arg...)
-	c.Assert(err, check.IsNil, check.Commentf("%q failed with errors: %s, %v", strings.Join(arg, " "), out, err))
+	c.Assert(err, checker.IsNil, check.Commentf("%q failed with errors: %s, %v", strings.Join(arg, " "), out, err))
 	return out
 }
 
@@ -83,9 +83,9 @@ func (s *DockerHubPullSuite) CmdWithError(name string, arg ...string) (string, e
 	return string(b), err
 }
 
-// MakeCmd returns a exec.Cmd command to run against the suite daemon.
+// MakeCmd returns an exec.Cmd command to run against the suite daemon.
 func (s *DockerHubPullSuite) MakeCmd(name string, arg ...string) *exec.Cmd {
-	args := []string{"--host", s.d.sock(), name}
+	args := []string{"--host", s.d.Sock(), name}
 	args = append(args, arg...)
 	return exec.Command(dockerBinary, args...)
 }

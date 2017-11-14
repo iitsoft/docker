@@ -6,32 +6,34 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
-	"github.com/docker/docker/image"
+	containertypes "github.com/docker/docker/api/types/container"
+	mounttypes "github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/container"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/runconfig"
-	"github.com/docker/docker/volume"
-	"github.com/opencontainers/runc/libcontainer/label"
+	"github.com/opencontainers/selinux/go-selinux/label"
+	"github.com/sirupsen/logrus"
 )
 
-// createContainerPlatformSpecificSettings performs platform specific container create functionality
-func createContainerPlatformSpecificSettings(container *Container, config *runconfig.Config, hostConfig *runconfig.HostConfig, img *image.Image) error {
+// createContainerOSSpecificSettings performs host-OS specific container create functionality
+func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Container, config *containertypes.Config, hostConfig *containertypes.HostConfig) error {
+	if err := daemon.Mount(container); err != nil {
+		return err
+	}
+	defer daemon.Unmount(container)
+
+	rootIDs := daemon.idMappings.RootPair()
+	if err := container.SetupWorkingDirectory(rootIDs); err != nil {
+		return err
+	}
+
 	for spec := range config.Volumes {
-		var (
-			name, destination string
-			parts             = strings.Split(spec, ":")
-		)
-		switch len(parts) {
-		case 2:
-			name, destination = parts[0], filepath.Clean(parts[1])
-		default:
-			name = stringid.GenerateNonCryptoID()
-			destination = filepath.Clean(parts[0])
-		}
+		name := stringid.GenerateNonCryptoID()
+		destination := filepath.Clean(spec)
+
 		// Skip volumes for which we already have something mounted on that
 		// destination because of a --volume-from.
-		if container.isDestinationMounted(destination) {
+		if container.IsDestinationMounted(destination) {
 			continue
 		}
 		path, err := container.GetResourcePath(destination)
@@ -44,33 +46,36 @@ func createContainerPlatformSpecificSettings(container *Container, config *runco
 			return fmt.Errorf("cannot mount volume over existing file, file exists %s", path)
 		}
 
-		volumeDriver := hostConfig.VolumeDriver
-		if destination != "" && img != nil {
-			if _, ok := img.ContainerConfig.Volumes[destination]; ok {
-				// check for whether bind is not specified and then set to local
-				if _, ok := container.MountPoints[destination]; !ok {
-					volumeDriver = volume.DefaultDriverName
-				}
-			}
-		}
-
-		v, err := container.daemon.createVolume(name, volumeDriver, nil)
+		v, err := daemon.volumes.CreateWithRef(name, hostConfig.VolumeDriver, container.ID, nil, nil)
 		if err != nil {
 			return err
 		}
 
-		if err := label.Relabel(v.Path(), container.MountLabel, "z"); err != nil {
+		if err := label.Relabel(v.Path(), container.MountLabel, true); err != nil {
 			return err
 		}
 
-		// never attempt to copy existing content in a container FS to a shared volume
-		if v.DriverName() == volume.DefaultDriverName {
-			if err := container.copyImagePathContent(v, destination); err != nil {
-				return err
-			}
+		container.AddMountPointWithVolume(destination, v, true)
+	}
+	return daemon.populateVolumes(container)
+}
+
+// populateVolumes copies data from the container's rootfs into the volume for non-binds.
+// this is only called when the container is created.
+func (daemon *Daemon) populateVolumes(c *container.Container) error {
+	for _, mnt := range c.MountPoints {
+		if mnt.Volume == nil {
+			continue
 		}
 
-		container.addMountPointWithVolume(destination, v, true)
+		if mnt.Type != mounttypes.TypeVolume || !mnt.CopyData {
+			continue
+		}
+
+		logrus.Debugf("copying image data from %s:%s, to %s", c.ID, mnt.Destination, mnt.Name)
+		if err := c.CopyImagePathContent(mnt.Volume, mnt.Destination); err != nil {
+			return err
+		}
 	}
 	return nil
 }

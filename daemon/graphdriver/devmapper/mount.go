@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // FIXME: this is copy-pasted from the aufs driver.
@@ -15,19 +16,17 @@ import (
 
 // Mounted returns true if a mount point exists.
 func Mounted(mountpoint string) (bool, error) {
-	mntpoint, err := os.Stat(mountpoint)
-	if err != nil {
+	var mntpointSt unix.Stat_t
+	if err := unix.Stat(mountpoint, &mntpointSt); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	parent, err := os.Stat(filepath.Join(mountpoint, ".."))
-	if err != nil {
+	var parentSt unix.Stat_t
+	if err := unix.Stat(filepath.Join(mountpoint, ".."), &parentSt); err != nil {
 		return false, err
 	}
-	mntpointSt := mntpoint.Sys().(*syscall.Stat_t)
-	parentSt := parent.Sys().(*syscall.Stat_t)
 	return mntpointSt.Dev != parentSt.Dev, nil
 }
 
@@ -66,7 +65,7 @@ func ProbeFsType(device string) (string, error) {
 	}
 
 	if uint64(l) != maxLen {
-		return "", fmt.Errorf("unable to detect filesystem type of %s, short read", device)
+		return "", fmt.Errorf("devmapper: unable to detect filesystem type of %s, short read", device)
 	}
 
 	for _, p := range probes {
@@ -75,7 +74,7 @@ func ProbeFsType(device string) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("Unknown filesystem type on %s", device)
+	return "", fmt.Errorf("devmapper: Unknown filesystem type on %s", device)
 }
 
 func joinMountOptions(a, b string) string {

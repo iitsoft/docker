@@ -3,68 +3,108 @@
 package runconfig
 
 import (
-	"strings"
+	"fmt"
+	"runtime"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/pkg/sysinfo"
 )
-
-// IsPrivate indicates whether container uses it's private network stack.
-func (n NetworkMode) IsPrivate() bool {
-	return !(n.IsHost() || n.IsContainer())
-}
-
-// IsDefault indicates whether container uses the default network stack.
-func (n NetworkMode) IsDefault() bool {
-	return n == "default"
-}
 
 // DefaultDaemonNetworkMode returns the default network stack the daemon should
 // use.
-func DefaultDaemonNetworkMode() NetworkMode {
-	return NetworkMode("bridge")
+func DefaultDaemonNetworkMode() container.NetworkMode {
+	return container.NetworkMode("bridge")
 }
 
-// NetworkName returns the name of the network stack.
-func (n NetworkMode) NetworkName() string {
-	if n.IsBridge() {
-		return "bridge"
-	} else if n.IsHost() {
-		return "host"
-	} else if n.IsContainer() {
-		return "container"
-	} else if n.IsNone() {
-		return "none"
-	} else if n.IsDefault() {
-		return "default"
+// IsPreDefinedNetwork indicates if a network is predefined by the daemon
+func IsPreDefinedNetwork(network string) bool {
+	n := container.NetworkMode(network)
+	return n.IsBridge() || n.IsHost() || n.IsNone() || n.IsDefault()
+}
+
+// validateNetMode ensures that the various combinations of requested
+// network settings are valid.
+func validateNetMode(c *container.Config, hc *container.HostConfig) error {
+	// We may not be passed a host config, such as in the case of docker commit
+	if hc == nil {
+		return nil
 	}
-	return ""
-}
 
-// IsBridge indicates whether container uses the bridge network stack
-func (n NetworkMode) IsBridge() bool {
-	return n == "bridge"
-}
-
-// IsHost indicates whether container uses the host network stack.
-func (n NetworkMode) IsHost() bool {
-	return n == "host"
-}
-
-// IsContainer indicates whether container uses a container network stack.
-func (n NetworkMode) IsContainer() bool {
-	parts := strings.SplitN(string(n), ":", 2)
-	return len(parts) > 1 && parts[0] == "container"
-}
-
-// IsNone indicates whether container isn't using a network stack.
-func (n NetworkMode) IsNone() bool {
-	return n == "none"
-}
-
-// MergeConfigs merges the specified container Config and HostConfig.
-// It creates a ContainerConfigWrapper.
-func MergeConfigs(config *Config, hostConfig *HostConfig) *ContainerConfigWrapper {
-	return &ContainerConfigWrapper{
-		config,
-		hostConfig,
-		"", nil,
+	err := validateNetContainerMode(c, hc)
+	if err != nil {
+		return err
 	}
+
+	if hc.UTSMode.IsHost() && c.Hostname != "" {
+		return ErrConflictUTSHostname
+	}
+
+	if hc.NetworkMode.IsHost() && len(hc.Links) > 0 {
+		return ErrConflictHostNetworkAndLinks
+	}
+
+	return nil
+}
+
+// validateIsolation performs platform specific validation of
+// isolation in the hostconfig structure. Linux only supports "default"
+// which is LXC container isolation
+func validateIsolation(hc *container.HostConfig) error {
+	// We may not be passed a host config, such as in the case of docker commit
+	if hc == nil {
+		return nil
+	}
+	if !hc.Isolation.IsValid() {
+		return fmt.Errorf("Invalid isolation: %q - %s only supports 'default'", hc.Isolation, runtime.GOOS)
+	}
+	return nil
+}
+
+// validateQoS performs platform specific validation of the QoS settings
+func validateQoS(hc *container.HostConfig) error {
+	// We may not be passed a host config, such as in the case of docker commit
+	if hc == nil {
+		return nil
+	}
+
+	if hc.IOMaximumBandwidth != 0 {
+		return fmt.Errorf("Invalid QoS settings: %s does not support configuration of maximum bandwidth", runtime.GOOS)
+	}
+
+	if hc.IOMaximumIOps != 0 {
+		return fmt.Errorf("Invalid QoS settings: %s does not support configuration of maximum IOPs", runtime.GOOS)
+	}
+	return nil
+}
+
+// validateResources performs platform specific validation of the resource settings
+// cpu-rt-runtime and cpu-rt-period can not be greater than their parent, cpu-rt-runtime requires sys_nice
+func validateResources(hc *container.HostConfig, si *sysinfo.SysInfo) error {
+	// We may not be passed a host config, such as in the case of docker commit
+	if hc == nil {
+		return nil
+	}
+
+	if hc.Resources.CPURealtimePeriod > 0 && !si.CPURealtimePeriod {
+		return fmt.Errorf("Your kernel does not support cgroup cpu real-time period")
+	}
+
+	if hc.Resources.CPURealtimeRuntime > 0 && !si.CPURealtimeRuntime {
+		return fmt.Errorf("Your kernel does not support cgroup cpu real-time runtime")
+	}
+
+	if hc.Resources.CPURealtimePeriod != 0 && hc.Resources.CPURealtimeRuntime != 0 && hc.Resources.CPURealtimeRuntime > hc.Resources.CPURealtimePeriod {
+		return fmt.Errorf("cpu real-time runtime cannot be higher than cpu real-time period")
+	}
+	return nil
+}
+
+// validatePrivileged performs platform specific validation of the Privileged setting
+func validatePrivileged(hc *container.HostConfig) error {
+	return nil
+}
+
+// validateReadonlyRootfs performs platform specific validation of the ReadonlyRootfs setting
+func validateReadonlyRootfs(hc *container.HostConfig) error {
+	return nil
 }

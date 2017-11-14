@@ -1,39 +1,36 @@
-// +build linux
+// +build linux,cgo
 
 package devicemapper
 
 /*
-#cgo LDFLAGS: -L. -ldevmapper
+#define _GNU_SOURCE
 #include <libdevmapper.h>
-#include <linux/loop.h> // FIXME: present only for defines, maybe we can remove it?
 #include <linux/fs.h>   // FIXME: present only for BLKGETSIZE64, maybe we can remove it?
-
-#ifndef LOOP_CTL_GET_FREE
-  #define LOOP_CTL_GET_FREE 0x4C82
-#endif
-
-#ifndef LO_FLAGS_PARTSCAN
-  #define LO_FLAGS_PARTSCAN 8
-#endif
 
 // FIXME: Can't we find a way to do the logging in pure Go?
 extern void DevmapperLogCallback(int level, char *file, int line, int dm_errno_or_class, char *str);
 
 static void	log_cb(int level, const char *file, int line, int dm_errno_or_class, const char *f, ...)
 {
-  char buffer[256];
-  va_list ap;
+	char *buffer = NULL;
+	va_list ap;
+	int ret;
 
-  va_start(ap, f);
-  vsnprintf(buffer, 256, f, ap);
-  va_end(ap);
+	va_start(ap, f);
+	ret = vasprintf(&buffer, f, ap);
+	va_end(ap);
+	if (ret < 0) {
+		// memory allocation failed -- should never happen?
+		return;
+	}
 
-  DevmapperLogCallback(level, (char *)file, line, dm_errno_or_class, buffer);
+	DevmapperLogCallback(level, (char *)file, line, dm_errno_or_class, buffer);
+	free(buffer);
 }
 
 static void	log_with_errno_init()
 {
-  dm_log_with_errno_init(log_cb);
+	dm_log_with_errno_init(log_cb);
 }
 */
 import "C"
@@ -45,48 +42,15 @@ import (
 
 type (
 	cdmTask C.struct_dm_task
-
-	cLoopInfo64 C.struct_loop_info64
-	loopInfo64  struct {
-		loDevice         uint64 /* ioctl r/o */
-		loInode          uint64 /* ioctl r/o */
-		loRdevice        uint64 /* ioctl r/o */
-		loOffset         uint64
-		loSizelimit      uint64 /* bytes, 0 == max available */
-		loNumber         uint32 /* ioctl r/o */
-		loEncryptType    uint32
-		loEncryptKeySize uint32 /* ioctl w/o */
-		loFlags          uint32 /* ioctl r/o */
-		loFileName       [LoNameSize]uint8
-		loCryptName      [LoNameSize]uint8
-		loEncryptKey     [LoKeySize]uint8 /* ioctl w/o */
-		loInit           [2]uint64
-	}
 )
 
 // IOCTL consts
 const (
 	BlkGetSize64 = C.BLKGETSIZE64
 	BlkDiscard   = C.BLKDISCARD
-
-	LoopSetFd       = C.LOOP_SET_FD
-	LoopCtlGetFree  = C.LOOP_CTL_GET_FREE
-	LoopGetStatus64 = C.LOOP_GET_STATUS64
-	LoopSetStatus64 = C.LOOP_SET_STATUS64
-	LoopClrFd       = C.LOOP_CLR_FD
-	LoopSetCapacity = C.LOOP_SET_CAPACITY
 )
 
-// LOOP consts. (?)
-const (
-	LoFlagsAutoClear = C.LO_FLAGS_AUTOCLEAR
-	LoFlagsReadOnly  = C.LO_FLAGS_READ_ONLY
-	LoFlagsPartScan  = C.LO_FLAGS_PARTSCAN
-	LoKeySize        = C.LO_KEY_SIZE
-	LoNameSize       = C.LO_NAME_SIZE
-)
-
-// DeviceMapper Udev consts. (?)
+// Devicemapper cookie flags.
 const (
 	DmUdevDisableSubsystemRulesFlag = C.DM_UDEV_DISABLE_SUBSYSTEM_RULES_FLAG
 	DmUdevDisableDiskRulesFlag      = C.DM_UDEV_DISABLE_DISK_RULES_FLAG
@@ -98,7 +62,6 @@ const (
 var (
 	DmGetLibraryVersion       = dmGetLibraryVersionFct
 	DmGetNextTarget           = dmGetNextTargetFct
-	DmLogInitVerbose          = dmLogInitVerboseFct
 	DmSetDevDir               = dmSetDevDirFct
 	DmTaskAddTarget           = dmTaskAddTargetFct
 	DmTaskCreate              = dmTaskCreateFct
@@ -266,10 +229,6 @@ func dmUdevWaitFct(cookie uint) int {
 
 func dmCookieSupportedFct() int {
 	return int(C.dm_cookie_supported())
-}
-
-func dmLogInitVerboseFct(level int) {
-	C.dm_log_init_verbose(C.int(level))
 }
 
 func logWithErrnoInitFct() {

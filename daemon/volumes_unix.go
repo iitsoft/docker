@@ -3,138 +3,114 @@
 package daemon
 
 import (
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/docker/docker/daemon/execdriver"
-	"github.com/docker/docker/pkg/system"
-	"github.com/docker/docker/runconfig"
+	"github.com/docker/docker/container"
+	"github.com/docker/docker/pkg/fileutils"
+	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/volume"
-	volumedrivers "github.com/docker/docker/volume/drivers"
+	"github.com/docker/docker/volume/drivers"
 	"github.com/docker/docker/volume/local"
-	"github.com/opencontainers/runc/libcontainer/label"
+	"github.com/pkg/errors"
 )
-
-// copyOwnership copies the permissions and uid:gid of the source file
-// to the destination file
-func copyOwnership(source, destination string) error {
-	stat, err := system.Stat(source)
-	if err != nil {
-		return err
-	}
-
-	if err := os.Chown(destination, int(stat.UID()), int(stat.Gid())); err != nil {
-		return err
-	}
-
-	return os.Chmod(destination, os.FileMode(stat.Mode()))
-}
 
 // setupMounts iterates through each of the mount points for a container and
 // calls Setup() on each. It also looks to see if is a network mount such as
 // /etc/resolv.conf, and if it is not, appends it to the array of mounts.
-func (container *Container) setupMounts() ([]execdriver.Mount, error) {
-	var mounts []execdriver.Mount
-	for _, m := range container.MountPoints {
-		path, err := m.Setup()
+func (daemon *Daemon) setupMounts(c *container.Container) ([]container.Mount, error) {
+	var mounts []container.Mount
+	// TODO: tmpfs mounts should be part of Mountpoints
+	tmpfsMounts := make(map[string]bool)
+	tmpfsMountInfo, err := c.TmpfsMounts()
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range tmpfsMountInfo {
+		tmpfsMounts[m.Destination] = true
+	}
+	for _, m := range c.MountPoints {
+		if tmpfsMounts[m.Destination] {
+			continue
+		}
+		if err := daemon.lazyInitializeVolume(c.ID, m); err != nil {
+			return nil, err
+		}
+		// If the daemon is being shutdown, we should not let a container start if it is trying to
+		// mount the socket the daemon is listening on. During daemon shutdown, the socket
+		// (/var/run/docker.sock by default) doesn't exist anymore causing the call to m.Setup to
+		// create at directory instead. This in turn will prevent the daemon to restart.
+		checkfunc := func(m *volume.MountPoint) error {
+			if _, exist := daemon.hosts[m.Source]; exist && daemon.IsShuttingDown() {
+				return fmt.Errorf("Could not mount %q to container while the daemon is shutting down", m.Source)
+			}
+			return nil
+		}
+
+		path, err := m.Setup(c.MountLabel, daemon.idMappings.RootPair(), checkfunc)
 		if err != nil {
 			return nil, err
 		}
-		if !container.trySetNetworkMount(m.Destination, path) {
-			mounts = append(mounts, execdriver.Mount{
+		if !c.TrySetNetworkMount(m.Destination, path) {
+			mnt := container.Mount{
 				Source:      path,
 				Destination: m.Destination,
 				Writable:    m.RW,
-			})
+				Propagation: string(m.Propagation),
+			}
+			if m.Volume != nil {
+				attributes := map[string]string{
+					"driver":      m.Volume.DriverName(),
+					"container":   c.ID,
+					"destination": m.Destination,
+					"read/write":  strconv.FormatBool(m.RW),
+					"propagation": string(m.Propagation),
+				}
+				daemon.LogVolumeEvent(m.Volume.Name(), "mount", attributes)
+			}
+			mounts = append(mounts, mnt)
 		}
 	}
 
 	mounts = sortMounts(mounts)
-	return append(mounts, container.networkMounts()...), nil
-}
-
-// parseBindMount validates the configuration of mount information in runconfig is valid.
-func parseBindMount(spec, volumeDriver string) (*mountPoint, error) {
-	bind := &mountPoint{
-		RW: true,
-	}
-	arr := strings.Split(spec, ":")
-
-	switch len(arr) {
-	case 2:
-		bind.Destination = arr[1]
-	case 3:
-		bind.Destination = arr[1]
-		mode := arr[2]
-		if !volume.ValidMountMode(mode) {
-			return nil, fmt.Errorf("invalid mode for volumes-from: %s", mode)
+	netMounts := c.NetworkMounts()
+	// if we are going to mount any of the network files from container
+	// metadata, the ownership must be set properly for potential container
+	// remapped root (user namespaces)
+	rootIDs := daemon.idMappings.RootPair()
+	for _, mount := range netMounts {
+		// we should only modify ownership of network files within our own container
+		// metadata repository. If the user specifies a mount path external, it is
+		// up to the user to make sure the file has proper ownership for userns
+		if strings.Index(mount.Source, daemon.repository) == 0 {
+			if err := os.Chown(mount.Source, rootIDs.UID, rootIDs.GID); err != nil {
+				return nil, err
+			}
 		}
-		bind.RW = volume.ReadWrite(mode)
-		// Mode field is used by SELinux to decide whether to apply label
-		bind.Mode = mode
-	default:
-		return nil, fmt.Errorf("Invalid volume specification: %s", spec)
 	}
-
-	//validate the volumes destination path
-	if !filepath.IsAbs(bind.Destination) {
-		return nil, fmt.Errorf("Invalid volume destination path: %s mount path must be absolute.", bind.Destination)
-	}
-
-	name, source, err := parseVolumeSource(arr[0])
-	if err != nil {
-		return nil, err
-	}
-
-	if len(source) == 0 {
-		bind.Driver = volumeDriver
-		if len(bind.Driver) == 0 {
-			bind.Driver = volume.DefaultDriverName
-		}
-	} else {
-		bind.Source = filepath.Clean(source)
-	}
-
-	bind.Name = name
-	bind.Destination = filepath.Clean(bind.Destination)
-	return bind, nil
+	return append(mounts, netMounts...), nil
 }
 
 // sortMounts sorts an array of mounts in lexicographic order. This ensure that
 // when mounting, the mounts don't shadow other mounts. For example, if mounting
 // /etc and /etc/resolv.conf, /etc/resolv.conf must not be mounted first.
-func sortMounts(m []execdriver.Mount) []execdriver.Mount {
+func sortMounts(m []container.Mount) []container.Mount {
 	sort.Sort(mounts(m))
 	return m
 }
 
-type mounts []execdriver.Mount
-
-// Len returns the number of mounts
-func (m mounts) Len() int {
-	return len(m)
-}
-
-// Less returns true if the number of parts (a/b/c would be 3 parts) in the
-// mount indexed by parameter 1 is less than that of the mount indexed by
-// parameter 2.
-func (m mounts) Less(i, j int) bool {
-	return m.parts(i) < m.parts(j)
-}
-
-// Swap swaps two items in an array of mounts.
-func (m mounts) Swap(i, j int) {
-	m[i], m[j] = m[j], m[i]
-}
-
-// parts returns the number of parts in the destination of a mount.
-func (m mounts) parts(i int) int {
-	return len(strings.Split(filepath.Clean(m[i].Destination), string(os.PathSeparator)))
+// setBindModeIfNull is platform specific processing to ensure the
+// shared mode is set to 'z' if it is null. This is called in the case
+// of processing a named volume and not a typical bind.
+func setBindModeIfNull(bind *volume.MountPoint) {
+	if bind.Mode == "" {
+		bind.Mode = "z"
+	}
 }
 
 // migrateVolume links the contents of a volume created pre Docker 1.7
@@ -143,7 +119,7 @@ func (m mounts) parts(i int) int {
 // It preserves the volume json configuration generated pre Docker 1.7 to be able to
 // downgrade from Docker 1.7 to Docker 1.6 without losing volume compatibility.
 func migrateVolume(id, vfs string) error {
-	l, err := volumedrivers.Lookup(volume.DefaultDriverName)
+	l, err := volumedrivers.GetDriver(volume.DefaultDriverName)
 	if err != nil {
 		return err
 	}
@@ -161,253 +137,99 @@ func migrateVolume(id, vfs string) error {
 	return os.Symlink(vfs, newDataPath)
 }
 
-// validVolumeLayout checks whether the volume directory layout
-// is valid to work with Docker post 1.7 or not.
-func validVolumeLayout(files []os.FileInfo) bool {
-	if len(files) == 1 && files[0].Name() == local.VolumeDataPathName && files[0].IsDir() {
-		return true
-	}
-
-	if len(files) != 2 {
-		return false
-	}
-
-	for _, f := range files {
-		if f.Name() == "config.json" ||
-			(f.Name() == local.VolumeDataPathName && f.Mode()&os.ModeSymlink == os.ModeSymlink) {
-			// Old volume configuration, we ignore it
-			continue
-		}
-		return false
-	}
-
-	return true
-}
-
 // verifyVolumesInfo ports volumes configured for the containers pre docker 1.7.
 // It reads the container configuration and creates valid mount points for the old volumes.
-func (daemon *Daemon) verifyVolumesInfo(container *Container) error {
+func (daemon *Daemon) verifyVolumesInfo(container *container.Container) error {
+	container.Lock()
+	defer container.Unlock()
+
 	// Inspect old structures only when we're upgrading from old versions
 	// to versions >= 1.7 and the MountPoints has not been populated with volumes data.
-	if len(container.MountPoints) == 0 && len(container.Volumes) > 0 {
-		for destination, hostPath := range container.Volumes {
+	type volumes struct {
+		Volumes   map[string]string
+		VolumesRW map[string]bool
+	}
+	cfgPath, err := container.ConfigPath()
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(cfgPath)
+	if err != nil {
+		return errors.Wrap(err, "could not open container config")
+	}
+	defer f.Close()
+	var cv volumes
+	if err := json.NewDecoder(f).Decode(&cv); err != nil {
+		return errors.Wrap(err, "could not decode container config")
+	}
+
+	if len(container.MountPoints) == 0 && len(cv.Volumes) > 0 {
+		for destination, hostPath := range cv.Volumes {
 			vfsPath := filepath.Join(daemon.root, "vfs", "dir")
-			rw := container.VolumesRW != nil && container.VolumesRW[destination]
+			rw := cv.VolumesRW != nil && cv.VolumesRW[destination]
 
 			if strings.HasPrefix(hostPath, vfsPath) {
 				id := filepath.Base(hostPath)
+				v, err := daemon.volumes.CreateWithRef(id, volume.DefaultDriverName, container.ID, nil, nil)
+				if err != nil {
+					return err
+				}
 				if err := migrateVolume(id, hostPath); err != nil {
 					return err
 				}
-				container.addLocalMountPoint(id, destination, rw)
+				container.AddMountPointWithVolume(destination, v, true)
 			} else { // Bind mount
-				id, source, err := parseVolumeSource(hostPath)
-				// We should not find an error here coming
-				// from the old configuration, but who knows.
-				if err != nil {
-					return err
-				}
-				container.addBindMountPoint(id, source, destination, rw)
+				m := volume.MountPoint{Source: hostPath, Destination: destination, RW: rw}
+				container.MountPoints[destination] = &m
 			}
 		}
-	} else if len(container.MountPoints) > 0 {
-		// Volumes created with a Docker version >= 1.7. We verify integrity in case of data created
-		// with Docker 1.7 RC versions that put the information in
-		// DOCKER_ROOT/volumes/VOLUME_ID rather than DOCKER_ROOT/volumes/VOLUME_ID/_container_data.
-		l, err := volumedrivers.Lookup(volume.DefaultDriverName)
-		if err != nil {
-			return err
-		}
-
-		for _, m := range container.MountPoints {
-			if m.Driver != volume.DefaultDriverName {
-				continue
-			}
-			dataPath := l.(*local.Root).DataPath(m.Name)
-			volumePath := filepath.Dir(dataPath)
-
-			d, err := ioutil.ReadDir(volumePath)
-			if err != nil {
-				// If the volume directory doesn't exist yet it will be recreated,
-				// so we only return the error when there is a different issue.
-				if !os.IsNotExist(err) {
-					return err
-				}
-				// Do not check when the volume directory does not exist.
-				continue
-			}
-			if validVolumeLayout(d) {
-				continue
-			}
-
-			if err := os.Mkdir(dataPath, 0755); err != nil {
-				return err
-			}
-
-			// Move data inside the data directory
-			for _, f := range d {
-				oldp := filepath.Join(volumePath, f.Name())
-				newp := filepath.Join(dataPath, f.Name())
-				if err := os.Rename(oldp, newp); err != nil {
-					logrus.Errorf("Unable to move %s to %s\n", oldp, newp)
-				}
-			}
-		}
-
-		return container.toDiskLocking()
 	}
-
 	return nil
 }
 
-// parseVolumesFrom ensure that the supplied volumes-from is valid.
-func parseVolumesFrom(spec string) (string, string, error) {
-	if len(spec) == 0 {
-		return "", "", fmt.Errorf("malformed volumes-from specification: %s", spec)
-	}
-
-	specParts := strings.SplitN(spec, ":", 2)
-	id := specParts[0]
-	mode := "rw"
-
-	if len(specParts) == 2 {
-		mode = specParts[1]
-		if !volume.ValidMountMode(mode) {
-			return "", "", fmt.Errorf("invalid mode for volumes-from: %s", mode)
-		}
-	}
-	return id, mode, nil
-}
-
-// registerMountPoints initializes the container mount points with the configured volumes and bind mounts.
-// It follows the next sequence to decide what to mount in each final destination:
-//
-// 1. Select the previously configured mount points for the containers, if any.
-// 2. Select the volumes mounted from another containers. Overrides previously configured mount point destination.
-// 3. Select the bind mounts set by the client. Overrides previously configured mount point destinations.
-func (daemon *Daemon) registerMountPoints(container *Container, hostConfig *runconfig.HostConfig) error {
-	binds := map[string]bool{}
-	mountPoints := map[string]*mountPoint{}
-
-	// 1. Read already configured mount points.
-	for name, point := range container.MountPoints {
-		mountPoints[name] = point
-	}
-
-	// 2. Read volumes from other containers.
-	for _, v := range hostConfig.VolumesFrom {
-		containerID, mode, err := parseVolumesFrom(v)
-		if err != nil {
-			return err
-		}
-
-		c, err := daemon.Get(containerID)
-		if err != nil {
-			return err
-		}
-
-		for _, m := range c.MountPoints {
-			cp := &mountPoint{
-				Name:        m.Name,
-				Source:      m.Source,
-				RW:          m.RW && volume.ReadWrite(mode),
-				Driver:      m.Driver,
-				Destination: m.Destination,
-			}
-
-			if len(cp.Source) == 0 {
-				v, err := daemon.createVolume(cp.Name, cp.Driver, nil)
-				if err != nil {
-					return err
-				}
-				cp.Volume = v
-			}
-
-			mountPoints[cp.Destination] = cp
-		}
-	}
-
-	// 3. Read bind mounts
-	for _, b := range hostConfig.Binds {
-		// #10618
-		bind, err := parseBindMount(b, hostConfig.VolumeDriver)
-		if err != nil {
-			return err
-		}
-
-		if binds[bind.Destination] {
-			return fmt.Errorf("Duplicate bind mount %s", bind.Destination)
-		}
-
-		if len(bind.Name) > 0 && len(bind.Driver) > 0 {
-			// create the volume
-			v, err := daemon.createVolume(bind.Name, bind.Driver, nil)
-			if err != nil {
-				return err
-			}
-			bind.Volume = v
-			bind.Source = v.Path()
-			// bind.Name is an already existing volume, we need to use that here
-			bind.Driver = v.DriverName()
-			// Since this is just a named volume and not a typical bind, set to shared mode `z`
-			if bind.Mode == "" {
-				bind.Mode = "z"
-			}
-		}
-
-		if err := label.Relabel(bind.Source, container.MountLabel, bind.Mode); err != nil {
-			return err
-		}
-		binds[bind.Destination] = true
-		mountPoints[bind.Destination] = bind
-	}
-
-	// Keep backwards compatible structures
-	bcVolumes := map[string]string{}
-	bcVolumesRW := map[string]bool{}
-	for _, m := range mountPoints {
-		if m.BackwardsCompatible() {
-			bcVolumes[m.Destination] = m.Path()
-			bcVolumesRW[m.Destination] = m.RW
-
-			// This mountpoint is replacing an existing one, so the count needs to be decremented
-			if mp, exists := container.MountPoints[m.Destination]; exists && mp.Volume != nil {
-				daemon.volumes.Decrement(mp.Volume)
-			}
-		}
-	}
-
-	container.Lock()
-	container.MountPoints = mountPoints
-	container.Volumes = bcVolumes
-	container.VolumesRW = bcVolumesRW
-	container.Unlock()
-
-	return nil
-}
-
-// createVolume creates a volume.
-func (daemon *Daemon) createVolume(name, driverName string, opts map[string]string) (volume.Volume, error) {
-	v, err := daemon.volumes.Create(name, driverName, opts)
+func (daemon *Daemon) mountVolumes(container *container.Container) error {
+	mounts, err := daemon.setupMounts(container)
 	if err != nil {
-		return nil, err
-	}
-	daemon.volumes.Increment(v)
-	return v, nil
-}
-
-// parseVolumeSource parses the origin sources that's mounted into the container.
-func parseVolumeSource(spec string) (string, string, error) {
-	if !filepath.IsAbs(spec) {
-		return spec, "", nil
+		return err
 	}
 
-	return "", spec, nil
-}
+	for _, m := range mounts {
+		dest, err := container.GetResourcePath(m.Destination)
+		if err != nil {
+			return err
+		}
 
-// BackwardsCompatible decides whether this mount point can be
-// used in old versions of Docker or not.
-// Only bind mounts and local volumes can be used in old versions of Docker.
-func (m *mountPoint) BackwardsCompatible() bool {
-	return len(m.Source) > 0 || m.Driver == volume.DefaultDriverName
+		var stat os.FileInfo
+		stat, err = os.Stat(m.Source)
+		if err != nil {
+			return err
+		}
+		if err = fileutils.CreateIfNotExists(dest, stat.IsDir()); err != nil {
+			return err
+		}
+
+		opts := "rbind,ro"
+		if m.Writable {
+			opts = "rbind,rw"
+		}
+
+		if err := mount.Mount(m.Source, dest, bindMountType, opts); err != nil {
+			return err
+		}
+
+		// mountVolumes() seems to be called for temporary mounts
+		// outside the container. Soon these will be unmounted with
+		// lazy unmount option and given we have mounted the rbind,
+		// all the submounts will propagate if these are shared. If
+		// daemon is running in host namespace and has / as shared
+		// then these unmounts will propagate and unmount original
+		// mount as well. So make all these mounts rprivate.
+		// Do not use propagation property of volume as that should
+		// apply only when mounting happen inside the container.
+		if err := mount.MakeRPrivate(dest); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

@@ -40,7 +40,7 @@ func FollowSymlinkInScope(path, root string) (string, error) {
 //
 // Example:
 //   If /foo/bar -> /outside,
-//   FollowSymlinkInScope("/foo/bar", "/foo") == "/foo/outside" instead of "/oustide"
+//   FollowSymlinkInScope("/foo/bar", "/foo") == "/foo/outside" instead of "/outside"
 //
 // IMPORTANT: it is the caller's responsibility to call evalSymlinksInScope *after* relevant symlinks
 // are created and not to create subsequently, additional symlinks that could potentially make a
@@ -95,8 +95,8 @@ func evalSymlinksInScope(path, root string) (string, error) {
 		// root gets prepended and we Clean again (to remove any trailing slash
 		// if the first Clean gave us just "/")
 		cleanP := filepath.Clean(string(filepath.Separator) + b.String() + p)
-		if cleanP == string(filepath.Separator) {
-			// never Lstat "/" itself
+		if isDriveOrRoot(cleanP) {
+			// never Lstat "/" itself, or drive letters on Windows
 			b.Reset()
 			continue
 		}
@@ -113,7 +113,8 @@ func evalSymlinksInScope(path, root string) (string, error) {
 			return "", err
 		}
 		if fi.Mode()&os.ModeSymlink == 0 {
-			b.WriteString(p + string(filepath.Separator))
+			b.WriteString(p)
+			b.WriteRune(filepath.Separator)
 			continue
 		}
 
@@ -131,4 +132,13 @@ func evalSymlinksInScope(path, root string) (string, error) {
 	// see note above on "fullP := ..." for why this is double-cleaned and
 	// what's happening here
 	return filepath.Clean(root + filepath.Clean(string(filepath.Separator)+b.String())), nil
+}
+
+// EvalSymlinks returns the path name after the evaluation of any symbolic
+// links.
+// If path is relative the result will be relative to the current directory,
+// unless one of the components is an absolute symbolic link.
+// This version has been updated to support long paths prepended with `\\?\`.
+func EvalSymlinks(path string) (string, error) {
+	return evalSymlinks(path)
 }

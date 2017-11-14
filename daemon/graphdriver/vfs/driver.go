@@ -1,5 +1,3 @@
-// +build linux windows
-
 package vfs
 
 import (
@@ -9,8 +7,15 @@ import (
 
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/pkg/chrootarchive"
+	"github.com/docker/docker/pkg/containerfs"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/system"
-	"github.com/opencontainers/runc/libcontainer/label"
+	"github.com/opencontainers/selinux/go-selinux/label"
+)
+
+var (
+	// CopyWithTar defines the copy method to use.
+	CopyWithTar = chrootarchive.NewArchiver(nil).CopyWithTar
 )
 
 func init() {
@@ -19,11 +24,16 @@ func init() {
 
 // Init returns a new VFS driver.
 // This sets the home directory for the driver and returns NaiveDiffDriver.
-func Init(home string, options []string) (graphdriver.Driver, error) {
+func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (graphdriver.Driver, error) {
 	d := &Driver{
-		home: home,
+		home:       home,
+		idMappings: idtools.NewIDMappingsFromMaps(uidMaps, gidMaps),
 	}
-	return graphdriver.NaiveDiffDriver(d), nil
+	rootIDs := d.idMappings.RootPair()
+	if err := idtools.MkdirAllAndChown(home, 0700, rootIDs); err != nil {
+		return nil, err
+	}
+	return graphdriver.NewNaiveDiffDriver(d, uidMaps, gidMaps), nil
 }
 
 // Driver holds information about the driver, home directory of the driver.
@@ -31,7 +41,8 @@ func Init(home string, options []string) (graphdriver.Driver, error) {
 // In order to support layering, files are copied from the parent layer into the new layer. There is no copy-on-write support.
 // Driver must be wrapped in NaiveDiffDriver to be used as a graphdriver.Driver
 type Driver struct {
-	home string
+	home       string
+	idMappings *idtools.IDMappings
 }
 
 func (d *Driver) String() string {
@@ -53,17 +64,28 @@ func (d *Driver) Cleanup() error {
 	return nil
 }
 
+// CreateReadWrite creates a layer that is writable for use as a container
+// file system.
+func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
+	return d.Create(id, parent, opts)
+}
+
 // Create prepares the filesystem for the VFS driver and copies the directory for the given id under the parent.
-func (d *Driver) Create(id, parent string) error {
+func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
+	if opts != nil && len(opts.StorageOpt) != 0 {
+		return fmt.Errorf("--storage-opt is not supported for vfs")
+	}
+
 	dir := d.dir(id)
-	if err := system.MkdirAll(filepath.Dir(dir), 0700); err != nil {
+	rootIDs := d.idMappings.RootPair()
+	if err := idtools.MkdirAllAndChown(filepath.Dir(dir), 0700, rootIDs); err != nil {
 		return err
 	}
-	if err := os.Mkdir(dir, 0755); err != nil {
+	if err := idtools.MkdirAndChown(dir, 0755, rootIDs); err != nil {
 		return err
 	}
-	opts := []string{"level:s0"}
-	if _, mountLabel, err := label.InitLabels(opts); err == nil {
+	labelOpts := []string{"level:s0"}
+	if _, mountLabel, err := label.InitLabels(labelOpts); err == nil {
 		label.SetFileLabel(dir, mountLabel)
 	}
 	if parent == "" {
@@ -73,10 +95,7 @@ func (d *Driver) Create(id, parent string) error {
 	if err != nil {
 		return fmt.Errorf("%s: %s", parent, err)
 	}
-	if err := chrootarchive.CopyWithTar(parentDir, dir); err != nil {
-		return err
-	}
-	return nil
+	return CopyWithTar(parentDir.Path(), dir)
 }
 
 func (d *Driver) dir(id string) string {
@@ -85,21 +104,18 @@ func (d *Driver) dir(id string) string {
 
 // Remove deletes the content from the directory for a given id.
 func (d *Driver) Remove(id string) error {
-	if _, err := os.Stat(d.dir(id)); err != nil {
-		return err
-	}
-	return os.RemoveAll(d.dir(id))
+	return system.EnsureRemoveAll(d.dir(id))
 }
 
 // Get returns the directory for the given id.
-func (d *Driver) Get(id, mountLabel string) (string, error) {
+func (d *Driver) Get(id, mountLabel string) (containerfs.ContainerFS, error) {
 	dir := d.dir(id)
 	if st, err := os.Stat(dir); err != nil {
-		return "", err
+		return nil, err
 	} else if !st.IsDir() {
-		return "", fmt.Errorf("%s: not a directory", dir)
+		return nil, fmt.Errorf("%s: not a directory", dir)
 	}
-	return dir, nil
+	return containerfs.NewLocalContainerFS(dir), nil
 }
 
 // Put is a noop for vfs that return nil for the error, since this driver has no runtime resources to clean up.

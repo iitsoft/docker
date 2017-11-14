@@ -1,92 +1,78 @@
 package main
 
 import (
-	"fmt"
 	"strings"
+	"time"
 
+	"github.com/docker/docker/integration-cli/checker"
+	"github.com/docker/docker/integration-cli/cli"
 	"github.com/go-check/check"
 )
 
 func (s *DockerSuite) TestPause(c *check.C) {
-	testRequires(c, DaemonIsLinux)
-	defer unpauseAllContainers()
+	testRequires(c, IsPausable)
 
 	name := "testeventpause"
-	dockerCmd(c, "run", "-d", "--name", name, "busybox", "top")
+	runSleepingContainer(c, "-d", "--name", name)
 
-	dockerCmd(c, "pause", name)
-	pausedContainers, err := getSliceOfPausedContainers()
-	if err != nil {
-		c.Fatalf("error thrown while checking if containers were paused: %v", err)
-	}
-	if len(pausedContainers) != 1 {
-		c.Fatalf("there should be one paused container and not %d", len(pausedContainers))
-	}
+	cli.DockerCmd(c, "pause", name)
+	pausedContainers := strings.Fields(
+		cli.DockerCmd(c, "ps", "-f", "status=paused", "-q", "-a").Combined(),
+	)
+	c.Assert(len(pausedContainers), checker.Equals, 1)
 
-	dockerCmd(c, "unpause", name)
+	cli.DockerCmd(c, "unpause", name)
 
-	out, _ := dockerCmd(c, "events", "--since=0", fmt.Sprintf("--until=%d", daemonTime(c).Unix()))
-	events := strings.Split(out, "\n")
-	if len(events) <= 1 {
-		c.Fatalf("Missing expected event")
-	}
+	out := cli.DockerCmd(c, "events", "--since=0", "--until", daemonUnixTime(c)).Combined()
+	events := strings.Split(strings.TrimSpace(out), "\n")
+	actions := eventActionsByIDAndType(c, events, name, "container")
 
-	pauseEvent := strings.Fields(events[len(events)-3])
-	unpauseEvent := strings.Fields(events[len(events)-2])
-
-	if pauseEvent[len(pauseEvent)-1] != "pause" {
-		c.Fatalf("event should be pause, not %#v", pauseEvent)
-	}
-	if unpauseEvent[len(unpauseEvent)-1] != "unpause" {
-		c.Fatalf("event should be unpause, not %#v", unpauseEvent)
-	}
-
+	c.Assert(actions[len(actions)-2], checker.Equals, "pause")
+	c.Assert(actions[len(actions)-1], checker.Equals, "unpause")
 }
 
 func (s *DockerSuite) TestPauseMultipleContainers(c *check.C) {
-	testRequires(c, DaemonIsLinux)
-	defer unpauseAllContainers()
+	testRequires(c, IsPausable)
 
 	containers := []string{
 		"testpausewithmorecontainers1",
 		"testpausewithmorecontainers2",
 	}
 	for _, name := range containers {
-		dockerCmd(c, "run", "-d", "--name", name, "busybox", "top")
+		runSleepingContainer(c, "-d", "--name", name)
 	}
-	dockerCmd(c, append([]string{"pause"}, containers...)...)
-	pausedContainers, err := getSliceOfPausedContainers()
-	if err != nil {
-		c.Fatalf("error thrown while checking if containers were paused: %v", err)
-	}
-	if len(pausedContainers) != len(containers) {
-		c.Fatalf("there should be %d paused container and not %d", len(containers), len(pausedContainers))
-	}
+	cli.DockerCmd(c, append([]string{"pause"}, containers...)...)
+	pausedContainers := strings.Fields(
+		cli.DockerCmd(c, "ps", "-f", "status=paused", "-q", "-a").Combined(),
+	)
+	c.Assert(len(pausedContainers), checker.Equals, len(containers))
 
-	dockerCmd(c, append([]string{"unpause"}, containers...)...)
+	cli.DockerCmd(c, append([]string{"unpause"}, containers...)...)
 
-	out, _ := dockerCmd(c, "events", "--since=0", fmt.Sprintf("--until=%d", daemonTime(c).Unix()))
-	events := strings.Split(out, "\n")
-	if len(events) <= len(containers)*3-2 {
-		c.Fatalf("Missing expected event")
-	}
+	out := cli.DockerCmd(c, "events", "--since=0", "--until", daemonUnixTime(c)).Combined()
+	events := strings.Split(strings.TrimSpace(out), "\n")
 
-	pauseEvents := make([][]string, len(containers))
-	unpauseEvents := make([][]string, len(containers))
-	for i := range containers {
-		pauseEvents[i] = strings.Fields(events[len(events)-len(containers)*2-1+i])
-		unpauseEvents[i] = strings.Fields(events[len(events)-len(containers)-1+i])
-	}
+	for _, name := range containers {
+		actions := eventActionsByIDAndType(c, events, name, "container")
 
-	for _, pauseEvent := range pauseEvents {
-		if pauseEvent[len(pauseEvent)-1] != "pause" {
-			c.Fatalf("event should be pause, not %#v", pauseEvent)
-		}
+		c.Assert(actions[len(actions)-2], checker.Equals, "pause")
+		c.Assert(actions[len(actions)-1], checker.Equals, "unpause")
 	}
-	for _, unpauseEvent := range unpauseEvents {
-		if unpauseEvent[len(unpauseEvent)-1] != "unpause" {
-			c.Fatalf("event should be unpause, not %#v", unpauseEvent)
-		}
-	}
+}
 
+func (s *DockerSuite) TestPauseFailsOnWindowsServerContainers(c *check.C) {
+	testRequires(c, DaemonIsWindows, NotPausable)
+	runSleepingContainer(c, "-d", "--name=test")
+	out, _, _ := dockerCmdWithError("pause", "test")
+	c.Assert(out, checker.Contains, "cannot pause Windows Server Containers")
+}
+
+func (s *DockerSuite) TestStopPausedContainer(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+
+	id := runSleepingContainer(c)
+	cli.WaitRun(c, id)
+	cli.DockerCmd(c, "pause", id)
+	cli.DockerCmd(c, "stop", id)
+	cli.WaitForInspectResult(c, id, "{{.State.Running}}", "false", 30*time.Second)
 }

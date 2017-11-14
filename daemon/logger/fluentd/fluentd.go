@@ -3,17 +3,21 @@
 package fluentd
 
 import (
-	"bytes"
 	"fmt"
 	"math"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
-	"text/template"
+	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/logger"
+	"github.com/docker/docker/daemon/logger/loggerutils"
+	"github.com/docker/docker/pkg/urlutil"
+	"github.com/docker/go-units"
 	"github.com/fluent/fluent-logger-golang/fluent"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type fluentd struct {
@@ -21,19 +25,34 @@ type fluentd struct {
 	containerID   string
 	containerName string
 	writer        *fluent.Fluent
+	extra         map[string]string
 }
 
-type receiver struct {
-	ID     string
-	FullID string
-	Name   string
+type location struct {
+	protocol string
+	host     string
+	port     int
+	path     string
 }
 
 const (
-	name             = "fluentd"
-	defaultHostName  = "localhost"
-	defaultPort      = 24224
-	defaultTagPrefix = "docker"
+	name = "fluentd"
+
+	defaultProtocol    = "tcp"
+	defaultHost        = "127.0.0.1"
+	defaultPort        = 24224
+	defaultBufferLimit = 1024 * 1024
+
+	// logger tries to reconnect 2**32 - 1 times
+	// failed (and panic) after 204 years [ 1.5 ** (2**32 - 1) - 1 seconds]
+	defaultRetryWait  = 1000
+	defaultMaxRetries = math.MaxInt32
+
+	addressKey      = "fluentd-address"
+	bufferLimitKey  = "fluentd-buffer-limit"
+	retryWaitKey    = "fluentd-retry-wait"
+	maxRetriesKey   = "fluentd-max-retries"
+	asyncConnectKey = "fluentd-async-connect"
 )
 
 func init() {
@@ -45,70 +64,83 @@ func init() {
 	}
 }
 
-func parseConfig(ctx logger.Context) (string, int, string, error) {
-	host := defaultHostName
-	port := defaultPort
-	tag := "docker." + ctx.ContainerID[:12]
-
-	config := ctx.Config
-
-	if address := config["fluentd-address"]; address != "" {
-		if h, p, err := net.SplitHostPort(address); err != nil {
-			if !strings.Contains(err.Error(), "missing port in address") {
-				return "", 0, "", err
-			}
-			host = h
-		} else {
-			portnum, err := strconv.Atoi(p)
-			if err != nil {
-				return "", 0, "", err
-			}
-			host = h
-			port = portnum
-		}
-	}
-
-	if config["fluentd-tag"] != "" {
-		receiver := &receiver{
-			ID:     ctx.ContainerID[:12],
-			FullID: ctx.ContainerID,
-			Name:   ctx.ContainerName,
-		}
-		tmpl, err := template.New("tag").Parse(config["fluentd-tag"])
-		if err != nil {
-			return "", 0, "", err
-		}
-		buf := new(bytes.Buffer)
-		if err := tmpl.Execute(buf, receiver); err != nil {
-			return "", 0, "", err
-		}
-		tag = buf.String()
-	}
-
-	return host, port, tag, nil
-}
-
 // New creates a fluentd logger using the configuration passed in on
-// the context. Supported context configuration variables are
-// fluentd-address & fluentd-tag.
-func New(ctx logger.Context) (logger.Logger, error) {
-	host, port, tag, err := parseConfig(ctx)
+// the context. The supported context configuration variable is
+// fluentd-address.
+func New(info logger.Info) (logger.Logger, error) {
+	loc, err := parseAddress(info.Config[addressKey])
 	if err != nil {
 		return nil, err
 	}
-	logrus.Debugf("logging driver fluentd configured for container:%s, host:%s, port:%d, tag:%s.", ctx.ContainerID, host, port, tag)
 
-	// logger tries to recoonect 2**32 - 1 times
-	// failed (and panic) after 204 years [ 1.5 ** (2**32 - 1) - 1 seconds]
-	log, err := fluent.New(fluent.Config{FluentPort: port, FluentHost: host, RetryWait: 1000, MaxRetry: math.MaxInt32})
+	tag, err := loggerutils.ParseLogTag(info, loggerutils.DefaultTemplate)
+	if err != nil {
+		return nil, err
+	}
+
+	extra, err := info.ExtraAttributes(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	bufferLimit := defaultBufferLimit
+	if info.Config[bufferLimitKey] != "" {
+		bl64, err := units.RAMInBytes(info.Config[bufferLimitKey])
+		if err != nil {
+			return nil, err
+		}
+		bufferLimit = int(bl64)
+	}
+
+	retryWait := defaultRetryWait
+	if info.Config[retryWaitKey] != "" {
+		rwd, err := time.ParseDuration(info.Config[retryWaitKey])
+		if err != nil {
+			return nil, err
+		}
+		retryWait = int(rwd.Seconds() * 1000)
+	}
+
+	maxRetries := defaultMaxRetries
+	if info.Config[maxRetriesKey] != "" {
+		mr64, err := strconv.ParseUint(info.Config[maxRetriesKey], 10, strconv.IntSize)
+		if err != nil {
+			return nil, err
+		}
+		maxRetries = int(mr64)
+	}
+
+	asyncConnect := false
+	if info.Config[asyncConnectKey] != "" {
+		if asyncConnect, err = strconv.ParseBool(info.Config[asyncConnectKey]); err != nil {
+			return nil, err
+		}
+	}
+
+	fluentConfig := fluent.Config{
+		FluentPort:       loc.port,
+		FluentHost:       loc.host,
+		FluentNetwork:    loc.protocol,
+		FluentSocketPath: loc.path,
+		BufferLimit:      bufferLimit,
+		RetryWait:        retryWait,
+		MaxRetry:         maxRetries,
+		AsyncConnect:     asyncConnect,
+	}
+
+	logrus.WithField("container", info.ContainerID).WithField("config", fluentConfig).
+		Debug("logging driver fluentd configured")
+
+	log, err := fluent.New(fluentConfig)
 	if err != nil {
 		return nil, err
 	}
 	return &fluentd{
 		tag:           tag,
-		containerID:   ctx.ContainerID,
-		containerName: ctx.ContainerName,
+		containerID:   info.ContainerID,
+		containerName: info.ContainerName,
 		writer:        log,
+		extra:         extra,
 	}, nil
 }
 
@@ -119,22 +151,15 @@ func (f *fluentd) Log(msg *logger.Message) error {
 		"source":         msg.Source,
 		"log":            string(msg.Line),
 	}
+	for k, v := range f.extra {
+		data[k] = v
+	}
+
+	ts := msg.Timestamp
+	logger.PutMessage(msg)
 	// fluent-logger-golang buffers logs from failures and disconnections,
 	// and these are transferred again automatically.
-	return f.writer.PostWithTime(f.tag, msg.Timestamp, data)
-}
-
-// ValidateLogOpt looks for fluentd specific log options fluentd-address & fluentd-tag.
-func ValidateLogOpt(cfg map[string]string) error {
-	for key := range cfg {
-		switch key {
-		case "fluentd-address":
-		case "fluentd-tag":
-		default:
-			return fmt.Errorf("unknown log opt '%s' for fluentd log driver", key)
-		}
-	}
-	return nil
+	return f.writer.PostWithTime(f.tag, ts, data)
 }
 
 func (f *fluentd) Close() error {
@@ -143,4 +168,83 @@ func (f *fluentd) Close() error {
 
 func (f *fluentd) Name() string {
 	return name
+}
+
+// ValidateLogOpt looks for fluentd specific log option fluentd-address.
+func ValidateLogOpt(cfg map[string]string) error {
+	for key := range cfg {
+		switch key {
+		case "env":
+		case "env-regex":
+		case "labels":
+		case "tag":
+		case addressKey:
+		case bufferLimitKey:
+		case retryWaitKey:
+		case maxRetriesKey:
+		case asyncConnectKey:
+			// Accepted
+		default:
+			return fmt.Errorf("unknown log opt '%s' for fluentd log driver", key)
+		}
+	}
+
+	_, err := parseAddress(cfg[addressKey])
+	return err
+}
+
+func parseAddress(address string) (*location, error) {
+	if address == "" {
+		return &location{
+			protocol: defaultProtocol,
+			host:     defaultHost,
+			port:     defaultPort,
+			path:     "",
+		}, nil
+	}
+
+	protocol := defaultProtocol
+	givenAddress := address
+	if urlutil.IsTransportURL(address) {
+		url, err := url.Parse(address)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid fluentd-address %s", givenAddress)
+		}
+		// unix and unixgram socket
+		if url.Scheme == "unix" || url.Scheme == "unixgram" {
+			return &location{
+				protocol: url.Scheme,
+				host:     "",
+				port:     0,
+				path:     url.Path,
+			}, nil
+		}
+		// tcp|udp
+		protocol = url.Scheme
+		address = url.Host
+	}
+
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		if !strings.Contains(err.Error(), "missing port in address") {
+			return nil, errors.Wrapf(err, "invalid fluentd-address %s", givenAddress)
+		}
+		return &location{
+			protocol: protocol,
+			host:     host,
+			port:     defaultPort,
+			path:     "",
+		}, nil
+	}
+
+	portnum, err := strconv.Atoi(port)
+	if err != nil {
+		return nil, errors.Wrapf(err, "invalid fluentd-address %s", givenAddress)
+	}
+	return &location{
+		protocol: protocol,
+		host:     host,
+		port:     portnum,
+		path:     "",
+	}, nil
 }
